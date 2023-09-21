@@ -97,13 +97,16 @@ fn main() {
 
     let dir = tempfile::tempdir().unwrap();
 
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let handle = rt.handle().clone();
+
     let dir = new_object_store_directory(
         Arc::new(LocalFileSystem::new()),
         dir.path().to_str().unwrap(),
         None,
         0,
         None,
-        None,
+        handle,
     )
     .unwrap();
 

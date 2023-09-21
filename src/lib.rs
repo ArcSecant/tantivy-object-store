@@ -52,7 +52,7 @@ struct ObjectStoreDirectory {
 
     local_fs: Arc<LocalFileSystem>,
 
-    rt: Arc<tokio::runtime::Runtime>,
+    rt: tokio::runtime::Handle,
     atomic_rw_lock: Arc<Mutex<()>>,
 }
 
@@ -64,7 +64,7 @@ struct ObjectStoreFileHandle {
     // We need to do the IO at construction time
     len: usize,
 
-    rt: Arc<tokio::runtime::Runtime>,
+    rt: tokio::runtime::Handle,
 }
 
 impl ObjectStoreFileHandle {
@@ -72,7 +72,7 @@ impl ObjectStoreFileHandle {
         store: Arc<dyn ObjectStore>,
         path: object_store::path::Path,
         len: usize,
-        rt: Arc<tokio::runtime::Runtime>,
+        rt: tokio::runtime::Handle,
     ) -> Self {
         Self {
             store,
@@ -92,8 +92,8 @@ impl HasLen for ObjectStoreFileHandle {
 #[async_trait]
 impl FileHandle for ObjectStoreFileHandle {
     fn read_bytes(&self, range: Range<usize>) -> std::io::Result<OwnedBytes> {
-        let handle = self.rt.handle();
-        handle.block_on(async { self.read_bytes_async(range).await })
+        self.rt
+            .block_on(async { self.read_bytes_async(range).await })
     }
 
     #[doc(hidden)]
@@ -114,7 +114,7 @@ struct ObjectStoreWriteHandle {
 
     write_handle: File,
     shutdown: AtomicBool,
-    rt: Arc<tokio::runtime::Runtime>,
+    rt: tokio::runtime::Handle,
 }
 
 impl ObjectStoreWriteHandle {
@@ -122,7 +122,7 @@ impl ObjectStoreWriteHandle {
         store: Arc<dyn ObjectStore>,
         location: object_store::path::Path,
         cache_loc: Arc<PathBuf>,
-        rt: Arc<tokio::runtime::Runtime>,
+        rt: tokio::runtime::Handle,
     ) -> Result<Self, std::io::Error> {
         let local_path = cache_loc.join(location.as_ref());
         debug!("creating write handle for {:?}", local_path);
@@ -221,8 +221,7 @@ impl ObjectStoreDirectory {
         let location = self
             .to_object_path(path)
             .map_err(|e| OpenReadError::wrap_io_error(e, path.to_path_buf()))?;
-        let handle = self.rt.handle();
-        handle
+        self.rt
             .block_on(async { self.store.head(&location).await })
             .map_err(|e| match e {
                 object_store::Error::NotFound { .. } => {
@@ -351,7 +350,7 @@ impl Directory for ObjectStoreDirectory {
 
         // Lock so no one can read a dirty version
         let _lock = self.atomic_rw_lock.lock().unwrap();
-        self.rt.handle().block_on(async {
+        self.rt.block_on(async {
             self.store
                 .put(&location, bytes::Bytes::from(data.to_vec()))
                 .await
@@ -424,25 +423,6 @@ impl Directory for ObjectStoreDirectory {
 /// NOTE: if you already run from an async context, dropping the returned Directory will cause the runtime to panic
 /// as it will attempt to shutdown the runtime inside an async context.
 ///
-/// # Example
-/// ```
-/// use std::sync::Arc;
-///
-/// use object_store::local::LocalFileSystem;
-/// use tantivy::{Index, IndexSettings, schema::{Schema, STORED, STRING, TEXT}};
-/// use tantivy_object_store::new_object_store_directory;
-///
-/// let store = Arc::new(LocalFileSystem::new());
-/// let base_path = format!("/tmp/{}", uuid::Uuid::new_v4());
-/// let dir = new_object_store_directory(store, &base_path, Some(0), 1, None, None).unwrap();
-///
-/// let mut schema_builder = Schema::builder();
-/// let id_field = schema_builder.add_text_field("id", STRING);
-/// let text_field = schema_builder.add_text_field("text", TEXT | STORED);
-/// let schema = schema_builder.build();
-///
-/// let idx = tantivy::Index::create(dir, schema.clone(), IndexSettings::default()).unwrap();
-///
 ///
 pub fn new_object_store_directory(
     store: Arc<dyn ObjectStore>,
@@ -450,7 +430,7 @@ pub fn new_object_store_directory(
     read_version: Option<u64>,
     write_version: u64,
     cache_loc: Option<&str>,
-    rt: Option<Arc<tokio::runtime::Runtime>>,
+    rt: tokio::runtime::Handle,
 ) -> Result<Box<dyn Directory>, std::io::Error> {
     if let Some(read_version) = read_version {
         if read_version > write_version {
@@ -472,11 +452,7 @@ pub fn new_object_store_directory(
         write_version,
         local_fs: Arc::new(LocalFileSystem::new()),
         cache_loc,
-        rt: rt.unwrap_or(Arc::new(
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()?,
-        )),
+        rt,
 
         atomic_rw_lock: Arc::new(Mutex::new(())),
     }))
@@ -495,135 +471,167 @@ mod test {
 
     use crate::new_object_store_directory;
 
-    #[test]
-    fn test_full_workflow() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_full_workflow() {
         env_logger::init();
 
         let store = Arc::new(LocalFileSystem::new());
 
         let base_path = format!("/tmp/{}", uuid::Uuid::new_v4().hyphenated());
 
-        let dir =
-            new_object_store_directory(store.clone(), &base_path, None, 0, None, None).unwrap();
-
-        let mut schema_builder = Schema::builder();
-        let id_field = schema_builder.add_text_field("id", STRING);
-        let text_field = schema_builder.add_text_field("text", TEXT | STORED);
-        let schema = schema_builder.build();
-
-        info!("Creating index");
-        let idx = tantivy::Index::create(dir, schema.clone(), IndexSettings::default()).unwrap();
-
-        info!("Creating writer");
-        let mut writer = idx.writer(1024 * 1024 * 64).unwrap();
-        info!("Write doc 1");
-        writer
-            .add_document(doc!(
-                id_field => "1",
-                text_field => "hello world"
-            ))
-            .unwrap();
-        info!("Write doc 2");
-        writer
-            .add_document(doc!(
-                id_field => "2",
-                text_field => "Deus Ex"
-            ))
-            .unwrap();
-        info!("COMMIT!");
-        writer.commit().unwrap();
-
-        std::mem::drop(writer);
-        std::mem::drop(idx);
-
-        // try open again and add some data
-        let dir =
-            new_object_store_directory(store.clone(), &base_path, Some(0), 1, None, None).unwrap();
-
-        info!("Open index");
-        let idx = tantivy::Index::open(dir).unwrap();
-
-        info!("Creating writer");
-        let mut writer = idx.writer(1024 * 1024 * 64).unwrap();
-        info!("Write doc 3");
-        writer
-            .add_document(doc!(
-                id_field => "3",
-                text_field => "bye bye"
-            ))
-            .unwrap();
-        info!("COMMIT!");
-        writer.commit().unwrap();
-        info!("wait for merging threads");
-        writer.wait_merging_threads().unwrap();
-
-        std::mem::drop(idx);
-
-        // open and search
-        let dir =
-            new_object_store_directory(store.clone(), &base_path, None, 0, None, None).unwrap();
-
-        info!("Open index");
-        let s3_idx = tantivy::Index::open(dir).unwrap();
-        let query_parser =
-            tantivy::query::QueryParser::for_index(&s3_idx, vec![id_field, text_field]);
-        let searcher = s3_idx.reader().unwrap().searcher();
-
-        info!("searching 1");
-        let query = query_parser.parse_query("hello").unwrap();
-        let top_docs = searcher
-            .search(&query, &tantivy::collector::TopDocs::with_limit(10))
-            .unwrap();
-        assert_eq!(top_docs.len(), 1);
-        let doc = top_docs.get(0).unwrap().1;
-        let retrieved_doc = searcher.doc(doc).unwrap();
-        // we only store the text field, so there won't be an id field
-        assert_eq!(
-            retrieved_doc,
-            doc!(
-                text_field => "hello world"
+        let handle = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            let dir = new_object_store_directory(
+                store.clone(),
+                &base_path,
+                None,
+                0,
+                None,
+                handle.clone(),
             )
-        );
-
-        info!("searching 2");
-        // No result -- not in this version
-        let query = query_parser.parse_query("bye").unwrap();
-        let top_docs = searcher
-            .search(&query, &tantivy::collector::TopDocs::with_limit(10))
-            .unwrap();
-        assert_eq!(top_docs.len(), 0);
-
-        info!("searching 3");
-        // finds the other doc
-        let query = query_parser.parse_query("ex").unwrap();
-        let top_docs = searcher
-            .search(&query, &tantivy::collector::TopDocs::with_limit(10))
             .unwrap();
 
-        assert_eq!(top_docs.len(), 1);
-        let doc = top_docs.get(0).unwrap().1;
-        let retrieved_doc = searcher.doc(doc).unwrap();
-        // we only store the text field, so there won't be an id field
-        assert_eq!(
-            retrieved_doc,
-            doc!(
-                text_field => "Deus Ex"
+            let mut schema_builder = Schema::builder();
+            let id_field = schema_builder.add_text_field("id", STRING);
+            let text_field = schema_builder.add_text_field("text", TEXT | STORED);
+            let schema = schema_builder.build();
+
+            info!("Creating index");
+            let idx =
+                tantivy::Index::create(dir, schema.clone(), IndexSettings::default()).unwrap();
+
+            info!("Creating writer");
+            let mut writer = idx.writer(1024 * 1024 * 64).unwrap();
+            info!("Write doc 1");
+            writer
+                .add_document(doc!(
+                    id_field => "1",
+                    text_field => "hello world"
+                ))
+                .unwrap();
+            info!("Write doc 2");
+            writer
+                .add_document(doc!(
+                    id_field => "2",
+                    text_field => "Deus Ex"
+                ))
+                .unwrap();
+            info!("COMMIT!");
+            writer.commit().unwrap();
+
+            std::mem::drop(writer);
+            std::mem::drop(idx);
+
+            // try open again and add some data
+            let dir = new_object_store_directory(
+                store.clone(),
+                &base_path,
+                Some(0),
+                1,
+                None,
+                handle.clone(),
             )
-        );
-
-        // open a differnet version and search
-        let dir =
-            new_object_store_directory(store.clone(), &base_path, None, 1, None, None).unwrap();
-        info!("Open Index");
-        let s3_idx = tantivy::Index::open(dir).unwrap();
-        let searcher = s3_idx.reader().unwrap().searcher();
-
-        info!("searching 4");
-        // is in the newer version
-        let query = query_parser.parse_query("bye").unwrap();
-        let top_docs = searcher
-            .search(&query, &tantivy::collector::TopDocs::with_limit(10))
             .unwrap();
-        assert_eq!(top_docs.len(), 1);
+
+            info!("Open index");
+            let idx = tantivy::Index::open(dir).unwrap();
+
+            info!("Creating writer");
+            let mut writer = idx.writer(1024 * 1024 * 64).unwrap();
+            info!("Write doc 3");
+            writer
+                .add_document(doc!(
+                    id_field => "3",
+                    text_field => "bye bye"
+                ))
+                .unwrap();
+            info!("COMMIT!");
+            writer.commit().unwrap();
+            info!("wait for merging threads");
+            writer.wait_merging_threads().unwrap();
+
+            std::mem::drop(idx);
+
+            // open and search
+            let dir = new_object_store_directory(
+                store.clone(),
+                &base_path,
+                None,
+                0,
+                None,
+                handle.clone(),
+            )
+            .unwrap();
+
+            info!("Open index");
+            let s3_idx = tantivy::Index::open(dir).unwrap();
+            let query_parser =
+                tantivy::query::QueryParser::for_index(&s3_idx, vec![id_field, text_field]);
+            let searcher = s3_idx.reader().unwrap().searcher();
+
+            info!("searching 1");
+            let query = query_parser.parse_query("hello").unwrap();
+            let top_docs = searcher
+                .search(&query, &tantivy::collector::TopDocs::with_limit(10))
+                .unwrap();
+            assert_eq!(top_docs.len(), 1);
+            let doc = top_docs.get(0).unwrap().1;
+            let retrieved_doc = searcher.doc(doc).unwrap();
+            // we only store the text field, so there won't be an id field
+            assert_eq!(
+                retrieved_doc,
+                doc!(
+                    text_field => "hello world"
+                )
+            );
+
+            info!("searching 2");
+            // No result -- not in this version
+            let query = query_parser.parse_query("bye").unwrap();
+            let top_docs = searcher
+                .search(&query, &tantivy::collector::TopDocs::with_limit(10))
+                .unwrap();
+            assert_eq!(top_docs.len(), 0);
+
+            info!("searching 3");
+            // finds the other doc
+            let query = query_parser.parse_query("ex").unwrap();
+            let top_docs = searcher
+                .search(&query, &tantivy::collector::TopDocs::with_limit(10))
+                .unwrap();
+
+            assert_eq!(top_docs.len(), 1);
+            let doc = top_docs.get(0).unwrap().1;
+            let retrieved_doc = searcher.doc(doc).unwrap();
+            // we only store the text field, so there won't be an id field
+            assert_eq!(
+                retrieved_doc,
+                doc!(
+                    text_field => "Deus Ex"
+                )
+            );
+
+            // open a differnet version and search
+            let dir = new_object_store_directory(
+                store.clone(),
+                &base_path,
+                None,
+                1,
+                None,
+                handle.clone(),
+            )
+            .unwrap();
+            info!("Open Index");
+            let s3_idx = tantivy::Index::open(dir).unwrap();
+            let searcher = s3_idx.reader().unwrap().searcher();
+
+            info!("searching 4");
+            // is in the newer version
+            let query = query_parser.parse_query("bye").unwrap();
+            let top_docs = searcher
+                .search(&query, &tantivy::collector::TopDocs::with_limit(10))
+                .unwrap();
+            assert_eq!(top_docs.len(), 1);
+        });
     }
 }
